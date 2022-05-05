@@ -7,6 +7,7 @@ from pprint import pformat
 from argparse import ArgumentParser
 from collections import defaultdict
 from itertools import chain
+from tqdm import tqdm
 
 import torch
 from torch.nn.parallel import DistributedDataParallel
@@ -16,16 +17,16 @@ from ignite.handlers import ModelCheckpoint, global_step_from_engine
 from ignite.metrics import Accuracy, Loss, MetricsLambda, RunningAverage
 from ignite.contrib.handlers import ProgressBar, PiecewiseLinear
 from ignite.contrib.handlers.tensorboard_logger import TensorboardLogger, OutputHandler, OptimizerParamsHandler
-from transformers import (AdamW, OpenAIGPTDoubleHeadsModel, OpenAIGPTTokenizer,
-                                  GPT2DoubleHeadsModel, GPT2Tokenizer, WEIGHTS_NAME, CONFIG_NAME)
+from transformers import (AdamW, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer,
+                                  GPT2LMHeadModel, GPT2Tokenizer, WEIGHTS_NAME, CONFIG_NAME)
 
 from utils import get_dataset, make_logdir
 
-SPECIAL_TOKENS = ["<bos>", "<eos>", "<speaker1>", "<speaker2>", "<pad>"]
+SPECIAL_TOKENS = ["<bos>", "<eos>", "<context>", "<history>", "<answer>", "<question>", "<pad>"]
 ATTR_TO_SPECIAL_TOKEN = {'bos_token': '<bos>', 'eos_token': '<eos>', 'pad_token': '<pad>',
-                         'additional_special_tokens': ['<speaker1>', '<speaker2>']}
-MODEL_INPUTS = ["input_ids", "mc_token_ids", "lm_labels", "mc_labels", "token_type_ids"]
-PADDED_INPUTS = ["input_ids", "lm_labels", "token_type_ids"]
+                         'additional_special_tokens': ['<context>', '<history>', '<answer>']}
+MODEL_INPUTS = ["input_ids", "labels", "token_type_ids"]
+PADDED_INPUTS = ["input_ids", "labels", "token_type_ids"]
 
 logger = logging.getLogger(__file__)
 
@@ -53,44 +54,51 @@ def add_special_tokens_(model, tokenizer):
     if num_added_tokens > 0:
         model.resize_token_embeddings(new_num_tokens=orig_num_tokens + num_added_tokens)
 
-def build_input_from_segments(persona, history, reply, tokenizer, lm_labels=False, with_eos=True):
+def build_input_from_segments(context, history, answer, question, tokenizer, lm_labels, with_eos=True):
     """ Build a sequence of input from 3 segments: persona, history and last reply. """
-    bos, eos, speaker1, speaker2 = tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS[:-1])
-    sequence = [[bos] + list(chain(*persona))] + history + [reply + ([eos] if with_eos else [])]
-    sequence = [sequence[0]] + [[speaker2 if (len(sequence)-i) % 2 else speaker1] + s for i, s in enumerate(sequence[1:])]
+    bos, eos, context_token, history_token, answer_token, question_token = SPECIAL_TOKENS[:-1]
+    context_tokenized = tokenizer.tokenize(context)
+    sequence = [[bos] + context_tokenized, [history_token] + tokenizer.tokenize(history), [answer_token] + tokenizer.tokenize(answer), [question_token] + tokenizer.tokenize(question) + ([eos] if with_eos else [])]
+    words = list(chain(*sequence))
+    if len(words) > 1024:
+        context_tokenized = context_tokenized[:-(len(words)-1024)]
+        sequence = [[bos] + context_tokenized, [history_token] + tokenizer.tokenize(history), [answer_token] + tokenizer.tokenize(answer), [question_token] + tokenizer.tokenize(question) + ([eos] if with_eos else [])]
+        words = list(chain(*sequence))
     instance = {}
-    instance["input_ids"] = list(chain(*sequence))
-    instance["token_type_ids"] = [speaker2 if i % 2 else speaker1 for i, s in enumerate(sequence) for _ in s]
-    instance["mc_token_ids"] = len(instance["input_ids"]) - 1
-    instance["lm_labels"] = [-100] * len(instance["input_ids"])
+    instance["input_ids"] = tokenizer.convert_tokens_to_ids(words)
+    assert len(instance["input_ids"]) <= 1024
+    instance["token_type_ids"] = [context_token for _ in range(len(sequence[0]))]
+    instance["token_type_ids"].extend([history_token for _ in range(len(sequence[1]))])
+    instance["token_type_ids"].extend([answer_token for _ in range(len(sequence[2]))])
+    instance["token_type_ids"].extend([question_token for _ in range(len(sequence[3]))])
+    instance["token_type_ids"] = tokenizer.convert_tokens_to_ids(instance["token_type_ids"])
+    instance["labels"] = [-100] * len(instance["input_ids"])
     if lm_labels:
-        instance["lm_labels"] = ([-100] * sum(len(s) for s in sequence[:-1])) + [-100] + sequence[-1][1:]
+        instance["labels"] = ([-100] * sum(len(s) for s in sequence[:-1])) + [-100] + tokenizer.convert_tokens_to_ids(sequence[-1][1:])
     return instance
 
 
 def get_data_loaders(args, tokenizer):
     """ Prepare the dataset for training and evaluation """
-    personachat = get_dataset(tokenizer, args.dataset_path, args.dataset_cache)
+    dataset_cache = args.dataset_cache + '_' + type(tokenizer).__name__  # To avoid using GPT cache for GPT-2 and vice-versa
+    if dataset_cache and os.path.isfile(dataset_cache):
+        logger.info("Load tokenized dataset from cache at %s", dataset_cache)
+        datasets = torch.load(dataset_cache)
+    else:
+        personachat = get_dataset(tokenizer, args.dataset_path, args.dataset_cache, args.max_history)
 
-    logger.info("Build inputs and labels")
-    datasets = {"train": defaultdict(list), "valid": defaultdict(list)}
-    for dataset_name, dataset in personachat.items():
-        num_candidates = len(dataset[0]["utterances"][0]["candidates"])
-        if args.num_candidates > 0 and dataset_name == 'train':
-            num_candidates = min(args.num_candidates, num_candidates)
-        for dialog in dataset:
-            persona = dialog["personality"].copy()
-            for _ in range(args.personality_permutations):
-                for utterance in dialog["utterances"]:
-                    history = utterance["history"][-(2*args.max_history+1):]
-                    for j, candidate in enumerate(utterance["candidates"][-num_candidates:]):
-                        lm_labels = bool(j == num_candidates-1)
-                        instance = build_input_from_segments(persona, history, candidate, tokenizer, lm_labels)
-                        for input_name, input_array in instance.items():
-                            datasets[dataset_name][input_name].append(input_array)
-                    datasets[dataset_name]["mc_labels"].append(num_candidates - 1)
-                    datasets[dataset_name]["n_candidates"] = num_candidates
-                persona = [persona[-1]] + persona[:-1]  # permuted personalities
+        logger.info("Build inputs and labels")
+        datasets = {"train": defaultdict(list), "valid": defaultdict(list)}
+        for dataset_name, dataset in personachat.items():
+            for dialog in tqdm(dataset):
+                history = dialog['history']
+                paragraph = dialog['context']
+                answer = dialog['orig_answer']['text']
+                question = dialog['question']
+                instance = build_input_from_segments(paragraph, history, answer, question, tokenizer, True)
+                for input_name, input_array in instance.items():
+                    datasets[dataset_name][input_name].append(input_array)
+        torch.save(datasets, dataset_cache)
 
     logger.info("Pad inputs and convert to Tensor")
     tensor_datasets = {"train": [], "valid": []}
@@ -98,8 +106,6 @@ def get_data_loaders(args, tokenizer):
         dataset = pad_dataset(dataset, padding=tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS[-1]))
         for input_name in MODEL_INPUTS:
             tensor = torch.tensor(dataset[input_name])
-            if input_name != "mc_labels":
-                tensor = tensor.view((-1, datasets[dataset_name]["n_candidates"]) + tensor.shape[1:])
             tensor_datasets[dataset_name].append(tensor)
 
     logger.info("Build train and validation dataloaders")
@@ -118,7 +124,7 @@ def train():
     parser = ArgumentParser()
     parser.add_argument("--dataset_path", type=str, default="", help="Path or url of the dataset. If empty download from S3.")
     parser.add_argument("--dataset_cache", type=str, default='./dataset_cache', help="Path or url of the dataset cache")
-    parser.add_argument("--model_checkpoint", type=str, default="openai-gpt", help="Path, url or short name of the model")
+    parser.add_argument("--model_checkpoint", type=str, default="gpt2", help="Path, url or short name of the model")
     parser.add_argument("--num_candidates", type=int, default=2, help="Number of candidates for training")
     parser.add_argument("--max_history", type=int, default=2, help="Number of previous exchanges to keep in history")
     parser.add_argument("--train_batch_size", type=int, default=4, help="Batch size for training")
@@ -153,7 +159,7 @@ def train():
     tokenizer = tokenizer_class.from_pretrained(args.model_checkpoint)
 
 
-    model_class = GPT2DoubleHeadsModel if "gpt2" in args.model_checkpoint else OpenAIGPTDoubleHeadsModel
+    model_class = GPT2LMHeadModel if "gpt2" in args.model_checkpoint else OpenAIGPTLMHeadModel
     model = model_class.from_pretrained(args.model_checkpoint)
     model.to(args.device)
     # Add special tokens if they are not already added
@@ -162,7 +168,7 @@ def train():
 
     # Prepare model for FP16 and distributed training if needed (order is important, distributed should be the last)
     if args.fp16:
-        from apex import amp  # Apex is only required if we use fp16 training
+        #from apex import amp  # Apex is only required if we use fp16 training
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16)
     if args.distributed:
         model = DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank)
@@ -174,15 +180,14 @@ def train():
     def update(engine, batch):
         model.train()
         batch = tuple(input_tensor.to(args.device) for input_tensor in batch)
-        input_ids, mc_token_ids, lm_labels, mc_labels, token_type_ids = batch
-        (lm_loss), (mc_loss), *_ = model(
-            input_ids, token_type_ids=token_type_ids, mc_token_ids=mc_token_ids,
-            mc_labels=mc_labels, lm_labels=lm_labels
+        input_ids, labels, token_type_ids = batch
+        (lm_loss), *_ = model(
+            input_ids, token_type_ids=token_type_ids, labels=labels
         )
-        loss = (lm_loss * args.lm_coef + mc_loss * args.mc_coef) / args.gradient_accumulation_steps
+        loss = lm_loss / args.gradient_accumulation_steps
         if args.fp16:
-            with amp.scale_loss(loss, optimizer) as scaled_loss:
-                scaled_loss.backward()
+            #with amp.scale_loss(loss, optimizer) as scaled_loss:
+            #    scaled_loss.backward()
             torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_norm)
         else:
             loss.backward()
@@ -198,15 +203,15 @@ def train():
         model.eval()
         with torch.no_grad():
             batch = tuple(input_tensor.to(args.device) for input_tensor in batch)
-            input_ids, mc_token_ids, lm_labels, mc_labels, token_type_ids = batch
-            logger.info(tokenizer.decode(input_ids[0, -1, :].tolist()))
+            input_ids, lm_labels, token_type_ids = batch
+            logger.info(tokenizer.decode(input_ids[0, :].tolist()))
             # if we dont send labels to model, it doesnt return losses
-            lm_logits, mc_logits, *_ = model(
-                input_ids, token_type_ids=token_type_ids, mc_token_ids=mc_token_ids,
+            lm_logits, *_ = model(
+                input_ids, token_type_ids=token_type_ids
             )
             lm_logits_flat_shifted = lm_logits[..., :-1, :].contiguous().view(-1, lm_logits.size(-1))
             lm_labels_flat_shifted = lm_labels[..., 1:].contiguous().view(-1)
-            return (lm_logits_flat_shifted, mc_logits), (lm_labels_flat_shifted, mc_labels)
+            return (lm_logits_flat_shifted, lm_labels_flat_shifted)
     evaluator = Engine(inference)
 
     # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
@@ -227,10 +232,8 @@ def train():
 
     # Prepare metrics - note how we compute distributed metrics
     RunningAverage(output_transform=lambda x: x).attach(trainer, "loss")
-    metrics = {"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: (x[0][0], x[1][0])),
-               "accuracy": Accuracy(output_transform=lambda x: (x[0][1], x[1][1]))}
-    metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args),
-                    "average_accuracy": MetricsLambda(average_distributed_scalar, metrics["accuracy"], args)})
+    metrics = {"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: (x[0], x[1]))}
+    metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args)})
     metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
     for name, metric in metrics.items():
         metric.attach(evaluator, name)
