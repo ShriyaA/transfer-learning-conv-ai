@@ -116,3 +116,15 @@ def make_logdir(model_name: str):
     logdir = os.path.join(
         'runs', current_time + '_' + socket.gethostname() + '_' + model_name)
     return logdir
+
+def get_sentence_by_character(sentence_list, start_character):
+    curr_char = 0
+    sentence = 0
+    for i, sent in enumerate(sentence_list):
+        end_char = curr_char + len(sent)
+        if start_character >= curr_char and start_character <= end_char:
+            sentence = i
+            break
+        start_character = end_char
+    return sentence
+

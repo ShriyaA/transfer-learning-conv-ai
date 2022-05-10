@@ -10,3 +10,7 @@ runs/
 .DS_Store
 gpt_personachat_cache_v2/
 *dataset_cache*
+venv/
+slurm_logs/
+run_sbatch.sh
+.ipynb_checkpoints/

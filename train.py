@@ -24,7 +24,7 @@ from utils import get_dataset, make_logdir
 
 SPECIAL_TOKENS = ["<bos>", "<eos>", "<context>", "<history>", "<answer>", "<question>", "<pad>"]
 ATTR_TO_SPECIAL_TOKEN = {'bos_token': '<bos>', 'eos_token': '<eos>', 'pad_token': '<pad>',
-                         'additional_special_tokens': ['<context>', '<history>', '<answer>']}
+                         'additional_special_tokens': ['<context>', '<history>', '<answer>', "<question>"]}
 MODEL_INPUTS = ["input_ids", "labels", "token_type_ids"]
 PADDED_INPUTS = ["input_ids", "labels", "token_type_ids"]
 
@@ -58,14 +58,26 @@ def build_input_from_segments(context, history, answer, question, tokenizer, lm_
     """ Build a sequence of input from 3 segments: persona, history and last reply. """
     bos, eos, context_token, history_token, answer_token, question_token = SPECIAL_TOKENS[:-1]
     context_tokenized = tokenizer.tokenize(context)
-    sequence = [[bos] + context_tokenized, [history_token] + tokenizer.tokenize(history), [answer_token] + tokenizer.tokenize(answer), [question_token] + tokenizer.tokenize(question) + ([eos] if with_eos else [])]
-    words = list(chain(*sequence))
-    if len(words) > 1024:
-        context_tokenized = context_tokenized[:-(len(words)-1024)]
+    if type(question) == str:
         sequence = [[bos] + context_tokenized, [history_token] + tokenizer.tokenize(history), [answer_token] + tokenizer.tokenize(answer), [question_token] + tokenizer.tokenize(question) + ([eos] if with_eos else [])]
         words = list(chain(*sequence))
+        if len(words) > 1024:
+            context_tokenized = context_tokenized[:-(len(words)-1024)]
+            sequence = [[bos] + context_tokenized, [history_token] + tokenizer.tokenize(history), [answer_token] + tokenizer.tokenize(answer), [question_token] + tokenizer.tokenize(question) + ([eos] if with_eos else [])]
+            words = list(chain(*sequence))
+        words = tokenizer.convert_tokens_to_ids(words)
+    else:
+        sequence = [[bos] + context_tokenized, [history_token] + tokenizer.tokenize(history), [answer_token] + tokenizer.tokenize(answer)]
+        words = list(chain(*sequence))
+        if len(words) + 1 + len(question) > 1024:
+            context_tokenized = context_tokenized[:-(len(words) + 1 + len(question) -1024)]
+            sequence = [[bos] + context_tokenized, [history_token] + tokenizer.tokenize(history), [answer_token] + tokenizer.tokenize(answer)]
+        words = list(chain(*sequence))
+        words = tokenizer.convert_tokens_to_ids(words) + tokenizer.convert_tokens_to_ids([question_token]) + question
+        sequence.append([question_token] + question)
+    
     instance = {}
-    instance["input_ids"] = tokenizer.convert_tokens_to_ids(words)
+    instance["input_ids"] = words
     assert len(instance["input_ids"]) <= 1024
     instance["token_type_ids"] = [context_token for _ in range(len(sequence[0]))]
     instance["token_type_ids"].extend([history_token for _ in range(len(sequence[1]))])
@@ -160,7 +172,7 @@ def train():
 
 
     model_class = GPT2LMHeadModel if "gpt2" in args.model_checkpoint else OpenAIGPTLMHeadModel
-    model = model_class.from_pretrained(args.model_checkpoint)
+    model = model_class.from_pretrained(args.model_checkpoint, cache_dir="/work/satmakuri_umass_edu/.cache/")
     model.to(args.device)
     # Add special tokens if they are not already added
     add_special_tokens_(model, tokenizer)
@@ -204,7 +216,7 @@ def train():
         with torch.no_grad():
             batch = tuple(input_tensor.to(args.device) for input_tensor in batch)
             input_ids, lm_labels, token_type_ids = batch
-            logger.info(tokenizer.decode(input_ids[0, :].tolist()))
+            #logger.verbose(tokenizer.decode(input_ids[0, :].tolist()))
             # if we dont send labels to model, it doesnt return losses
             lm_logits, *_ = model(
                 input_ids, token_type_ids=token_type_ids
